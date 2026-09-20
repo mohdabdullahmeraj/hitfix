@@ -88,14 +88,27 @@ def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_nam
 
         cn_pos = None
         if adj is not None:
-            cn_pos = (torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)) / 6.2).unsqueeze(-1)
+            cn_pos = (torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)) / 6.2).unsqueeze(-1) if edge[0].size(0) <= 200000 else None
+            if cn_pos is None:
+                # batch the CN lookup to avoid a huge intermediate tensor
+                cn_chunks = []
+                for start in range(0, edge[0].size(0), 50000):
+                    e0 = edge[0][start:start+50000]
+                    e1 = edge[1][start:start+50000]
+                    cn_chunks.append(torch.log1p((adj[e0] * adj[e1]).sum(dim=1)) / 6.2)
+                cn_pos = torch.cat(cn_chunks).unsqueeze(-1)
         pos_out = predictor(h[edge[0]], h[edge[1]], cn_pos)
 
         edge = neg_sampler(g, edge[0])
 
         cn_neg = None
         if adj is not None:
-            cn_neg = (torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)) / 6.2).unsqueeze(-1)
+            cn_chunks = []
+            for start in range(0, edge[0].size(0), 50000):
+                e0 = edge[0][start:start+50000]
+                e1 = edge[1][start:start+50000]
+                cn_chunks.append(torch.log1p((adj[e0] * adj[e1]).sum(dim=1)) / 6.2)
+            cn_neg = torch.cat(cn_chunks).unsqueeze(-1)
         neg_out = predictor(h[edge[0]], h[edge[1]], cn_neg)
         if num_neg_samples > 1:
             pos_out_expanded = pos_out.repeat_interleave(num_neg_samples, dim=0)
