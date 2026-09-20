@@ -64,7 +64,8 @@ class LinkPredictor(torch.nn.Module):
         return torch.sigmoid(x)
 
 
-def train(model, predictor, g, x, split_edge, optimizer, batch_size,dataset_name):
+def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_name,
+          loss_type="bce", focal_gamma=2.0, focal_alpha=0.25):
     model.train()
     predictor.train()
 
@@ -81,12 +82,23 @@ def train(model, predictor, g, x, split_edge, optimizer, batch_size,dataset_name
         edge = pos_train_edge[perm].t()
 
         pos_out = predictor(h[edge[0]], h[edge[1]])
-        pos_loss = -torch.log(pos_out + 1e-15).mean()
 
         edge = neg_sampler(g, edge[0])
 
         neg_out = predictor(h[edge[0]], h[edge[1]])
-        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
+
+        if loss_type == "focal":
+            # Focal loss (Lin et al. 2017): FL(p) = -alpha * (1-p)^gamma * log(p)
+            # Down-weights examples the model already scores confidently/correctly;
+            # up-weights the ones it is still getting wrong.
+            pos_loss = -focal_alpha * ((1 - pos_out) ** focal_gamma) * torch.log(pos_out + 1e-15)
+            neg_loss = -(1 - focal_alpha) * (neg_out ** focal_gamma) * torch.log(1 - neg_out + 1e-15)
+            pos_loss = pos_loss.mean()
+            neg_loss = neg_loss.mean()
+        else:
+            # Original plain BCE (baseline — unchanged from the base paper's code)
+            pos_loss = -torch.log(pos_out + 1e-15).mean()
+            neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
 
         loss = pos_loss + neg_loss
         loss.backward()
@@ -284,6 +296,13 @@ def main():
     # training settings
     parser.add_argument("--eval_steps", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
+    # HitFix Phase 3 — Fix B: focal loss (toggle-able so it can be run as an isolated experiment)
+    parser.add_argument("--loss_type", type=str, default="bce", choices=["bce", "focal"],
+                         help="bce = original loss (baseline), focal = focal loss (Fix B)")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                         help="focal loss focusing parameter (higher = more focus on hard examples)")
+    parser.add_argument("--focal_alpha", type=float, default=0.25,
+                         help="focal loss balancing parameter for the positive class")
     args = parser.parse_args()
     print(args)
 
@@ -430,7 +449,8 @@ def main():
 
                 for epoch in range(1, 1 + args.epochs):
                     loss = train(model, predictor, g, g.ndata["feat"], split_edge, optimizer, args.batch_size,
-                                 args.dataset)
+                                 args.dataset, loss_type=args.loss_type,
+                                 focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha)
 
                     if epoch % args.eval_steps == 0:
                         results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size)
