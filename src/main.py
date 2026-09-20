@@ -65,12 +65,14 @@ class LinkPredictor(torch.nn.Module):
 
 
 def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_name,
-          loss_type="bce", focal_gamma=2.0, focal_alpha=0.25):
+          loss_type="bce", focal_gamma=2.0, focal_alpha=0.25,
+          asl_gamma_pos=0.0, asl_gamma_neg=4.0, asl_margin=0.05,
+          num_neg_samples=1):
     model.train()
     predictor.train()
 
     pos_train_edge = split_edge["train"]["edge"].to(x.device)
-    neg_sampler = GlobalUniform(1)
+    neg_sampler = GlobalUniform(num_neg_samples)
     total_loss = total_examples = 0
     for perm in DataLoader(
             range(pos_train_edge.size(0)), batch_size, shuffle=True
@@ -86,11 +88,18 @@ def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_nam
         edge = neg_sampler(g, edge[0])
 
         neg_out = predictor(h[edge[0]], h[edge[1]])
+        if num_neg_samples > 1:
+            pos_out_expanded = pos_out.repeat_interleave(num_neg_samples, dim=0)
+        else:
+            pos_out_expanded = pos_out
 
-        if loss_type == "focal":
-            # Focal loss (Lin et al. 2017): FL(p) = -alpha * (1-p)^gamma * log(p)
-            # Down-weights examples the model already scores confidently/correctly;
-            # up-weights the ones it is still getting wrong.
+        if loss_type == "asl":
+            pos_loss = -((1 - pos_out) ** asl_gamma_pos) * torch.log(pos_out + 1e-15)
+            neg_out_shifted = (neg_out - asl_margin).clamp(min=0)
+            neg_loss = -((neg_out_shifted) ** asl_gamma_neg) * torch.log(1 - neg_out_shifted + 1e-15)
+            pos_loss = pos_loss.mean()
+            neg_loss = neg_loss.mean()
+        elif loss_type == "focal":
             pos_loss = -focal_alpha * ((1 - pos_out) ** focal_gamma) * torch.log(pos_out + 1e-15)
             neg_loss = -(1 - focal_alpha) * (neg_out ** focal_gamma) * torch.log(1 - neg_out + 1e-15)
             pos_loss = pos_loss.mean()
@@ -297,12 +306,20 @@ def main():
     parser.add_argument("--eval_steps", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
     # HitFix Phase 3 — Fix B: focal loss (toggle-able so it can be run as an isolated experiment)
-    parser.add_argument("--loss_type", type=str, default="bce", choices=["bce", "focal"],
+    parser.add_argument("--loss_type", type=str, default="bce", choices=["bce", "focal", "asl"],
                          help="bce = original loss (baseline), focal = focal loss (Fix B)")
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                          help="focal loss focusing parameter (higher = more focus on hard examples)")
     parser.add_argument("--focal_alpha", type=float, default=0.25,
                          help="focal loss balancing parameter for the positive class")
+    parser.add_argument("--asl_gamma_pos", type=float, default=0.0,
+                         help="ASL focusing parameter for positives (usually low/zero)")
+    parser.add_argument("--asl_gamma_neg", type=float, default=4.0,
+                         help="ASL focusing parameter for negatives (usually higher than gamma_pos)")
+    parser.add_argument("--asl_margin", type=float, default=0.05,
+                         help="ASL probability margin — shifts easy-negative loss contribution toward zero")
+    parser.add_argument("--num_neg_samples", type=int, default=1,
+                         help="number of negative edges sampled per positive edge during training (default 1, matches base paper)")
     args = parser.parse_args()
     print(args)
 
@@ -450,7 +467,9 @@ def main():
                 for epoch in range(1, 1 + args.epochs):
                     loss = train(model, predictor, g, g.ndata["feat"], split_edge, optimizer, args.batch_size,
                                  args.dataset, loss_type=args.loss_type,
-                                 focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha)
+                                 focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha,
+                                 asl_gamma_pos=args.asl_gamma_pos, asl_gamma_neg=args.asl_gamma_neg,
+                                 asl_margin=args.asl_margin, num_neg_samples=args.num_neg_samples)
 
                     if epoch % args.eval_steps == 0:
                         results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size)
