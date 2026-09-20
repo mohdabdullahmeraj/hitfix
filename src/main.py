@@ -36,17 +36,18 @@ current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 class LinkPredictor(torch.nn.Module):
     def __init__(
-            self, in_channels, hidden_channels, out_channels, num_layers, dropout
+            self, in_channels, hidden_channels, out_channels, num_layers, dropout, extra_feat_dim=0
     ):
         super(LinkPredictor, self).__init__()
 
         self.lins = torch.nn.ModuleList()
-        self.lins.append(Linear(in_channels, hidden_channels))
+        self.lins.append(Linear(in_channels + extra_feat_dim, hidden_channels))
         for _ in range(num_layers - 2):
             self.lins.append(Linear(hidden_channels, hidden_channels))
         self.lins.append(Linear(hidden_channels, out_channels))
 
         self.dropout = dropout
+        self.extra_feat_dim = extra_feat_dim
 
         self.reset_parameters()
 
@@ -54,8 +55,10 @@ class LinkPredictor(torch.nn.Module):
         for lin in self.lins:
             lin.reset_parameters()
 
-    def forward(self, x_i, x_j):
+    def forward(self, x_i, x_j, extra_feat=None):
         x = x_i * x_j
+        if self.extra_feat_dim > 0 and extra_feat is not None:
+            x = torch.cat([x, extra_feat], dim=-1)
         for lin in self.lins[:-1]:
             x = lin(x)
             x = F.relu(x)
@@ -67,7 +70,7 @@ class LinkPredictor(torch.nn.Module):
 def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_name,
           loss_type="bce", focal_gamma=2.0, focal_alpha=0.25,
           asl_gamma_pos=0.0, asl_gamma_neg=4.0, asl_margin=0.05,
-          num_neg_samples=1):
+          num_neg_samples=1, adj=None):
     model.train()
     predictor.train()
 
@@ -83,11 +86,17 @@ def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_nam
 
         edge = pos_train_edge[perm].t()
 
-        pos_out = predictor(h[edge[0]], h[edge[1]])
+        cn_pos = None
+        if adj is not None:
+            cn_pos = torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)).unsqueeze(-1)
+        pos_out = predictor(h[edge[0]], h[edge[1]], cn_pos)
 
         edge = neg_sampler(g, edge[0])
 
-        neg_out = predictor(h[edge[0]], h[edge[1]])
+        cn_neg = None
+        if adj is not None:
+            cn_neg = torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)).unsqueeze(-1)
+        neg_out = predictor(h[edge[0]], h[edge[1]], cn_neg)
         if num_neg_samples > 1:
             pos_out_expanded = pos_out.repeat_interleave(num_neg_samples, dim=0)
         else:
@@ -134,7 +143,7 @@ def accuracy(pred, label):
 
 
 @torch.no_grad()
-def test(model, predictor, g, x, split_edge, evaluator, batch_size):
+def test(model, predictor, g, x, split_edge, evaluator, batch_size, adj=None):
     model.eval()
     predictor.eval()
 
@@ -153,7 +162,10 @@ def test(model, predictor, g, x, split_edge, evaluator, batch_size):
         preds = []
         for perm in DataLoader(range(test_edges.size(0)), batch_size):
             edge = test_edges[perm].t()
-            pred = predictor(h[edge[0]], h[edge[1]]).squeeze()
+            cn_feat = None
+            if adj is not None:
+                cn_feat = torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)).unsqueeze(-1)
+            pred = predictor(h[edge[0]], h[edge[1]], cn_feat).squeeze()
             if pred.dim() == 0:
                 pred = pred.unsqueeze(0)
             preds.append(pred.cpu())
@@ -320,6 +332,8 @@ def main():
                          help="ASL probability margin — shifts easy-negative loss contribution toward zero")
     parser.add_argument("--num_neg_samples", type=int, default=1,
                          help="number of negative edges sampled per positive edge during training (default 1, matches base paper)")
+    parser.add_argument("--use_common_neighbors", action="store_true",
+                         help="augment the link predictor with a common-neighbor-count structural feature")
     args = parser.parse_args()
     print(args)
 
@@ -357,7 +371,15 @@ def main():
             split_edge["eval_train"] = {"edge": split_edge["train"]["edge"][idx]}
             evaluator = TDCDDIEvaluator(name='TDC_DDI')
 
-
+        # === HitFix: common-neighbor structural feature (built once per dataset) ===
+        adj = None
+        if args.use_common_neighbors:
+            num_nodes = g.num_nodes()
+            adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32, device=device)
+            train_edges_cn = split_edge["train"]["edge"].to(device)
+            adj[train_edges_cn[:, 0], train_edges_cn[:, 1]] = 1.0
+            adj[train_edges_cn[:, 1], train_edges_cn[:, 0]] = 1.0
+        # === END ===
 
         if dataset.name == "ogbl-ddi":
             emb = torch.nn.Embedding(g.num_nodes(), args.hidden_channels).to(device)
@@ -433,7 +455,8 @@ def main():
 
 
             # Initialize predictor and move to device
-            predictor = LinkPredictor(args.hidden_channels, args.hidden_channels, 1, 3, args.dropout)
+            predictor = LinkPredictor(args.hidden_channels, args.hidden_channels, 1, 3, args.dropout,
+                                       extra_feat_dim=(1 if args.use_common_neighbors else 0))
             g, model, predictor = map(lambda x: x.to(device), (g, model, predictor))
 
             # Initialize loggers for each model-dataset combination
@@ -469,10 +492,10 @@ def main():
                                  args.dataset, loss_type=args.loss_type,
                                  focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha,
                                  asl_gamma_pos=args.asl_gamma_pos, asl_gamma_neg=args.asl_gamma_neg,
-                                 asl_margin=args.asl_margin, num_neg_samples=args.num_neg_samples)
+                                 asl_margin=args.asl_margin, num_neg_samples=args.num_neg_samples, adj=adj)
 
                     if epoch % args.eval_steps == 0:
-                        results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size)
+                        results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size, adj=adj)
 
                         # === PHASE 2 DIAGNOSIS: save embeddings + pos/neg pair features at best-valid-Hits@20 epoch ===
                         valid_hits20 = results["Hits@20"][1]
