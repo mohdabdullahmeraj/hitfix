@@ -537,6 +537,15 @@ def main():
                                 "pos_pair_features": pos_feat,
                                 "neg_pair_features": neg_feat,
                             }, f"{emb_dir}/run{run}_best_embeddings.pt")
+
+                            # === PHASE 6: also save the actual trained model + predictor for GNNExplainer ===
+                            torch.save({
+                                "epoch": epoch,
+                                "valid_hits20": valid_hits20,
+                                "model_state": model.state_dict(),
+                                "predictor_state": predictor.state_dict(),
+                            }, f"{emb_dir}/run{run}_best_model.pt")
+                            # === END PHASE 6 ===
                         # === END PHASE 2 DIAGNOSIS ===
 
                         log_file_path = f"../results/training/run{run}_{dataset.name}_{model_name}_train_validation.csv"
