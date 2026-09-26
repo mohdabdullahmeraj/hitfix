@@ -544,7 +544,7 @@ def main():
                                 "valid_hits20": valid_hits20,
                                 "model_state": model.state_dict(),
                                 "predictor_state": predictor.state_dict(),
-                                "node_features": x.detach().cpu(),  # the actual trained input (learned embedding table for ogbl-ddi)
+                                "node_features": g.ndata["feat"].detach().cpu(),  # the actual trained input (learned embedding table for ogbl-ddi)
                             }, f"{emb_dir}/run{run}_best_model.pt")
                             # === END PHASE 6 ===
                         # === END PHASE 2 DIAGNOSIS ===
