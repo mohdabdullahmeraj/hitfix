@@ -538,12 +538,13 @@ def main():
                                 "neg_pair_features": neg_feat,
                             }, f"{emb_dir}/run{run}_best_embeddings.pt")
 
-                            # === PHASE 6: also save the actual trained model + predictor for GNNExplainer ===
+                            # === PHASE 6: also save the actual trained model + predictor + input embedding table for GNNExplainer ===
                             torch.save({
                                 "epoch": epoch,
                                 "valid_hits20": valid_hits20,
                                 "model_state": model.state_dict(),
                                 "predictor_state": predictor.state_dict(),
+                                "node_features": x.detach().cpu(),  # the actual trained input (learned embedding table for ogbl-ddi)
                             }, f"{emb_dir}/run{run}_best_model.pt")
                             # === END PHASE 6 ===
                         # === END PHASE 2 DIAGNOSIS ===
