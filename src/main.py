@@ -14,6 +14,7 @@ from ogb.linkproppred import DglLinkPropPredDataset, Evaluator
 from torch.nn import Linear
 from torch.utils.data import DataLoader
 from biosnap_data_loader import BioSnapDDIDataset
+from fixed_ddi_loader import FixedDDIDataset
 from tdc_data_loader import TDCDDIDataset
 
 
@@ -67,10 +68,22 @@ class LinkPredictor(torch.nn.Module):
         return torch.sigmoid(x)
 
 
+def cn_feature(adj, src, dst, scale=6.2, max_elems=200_000_000):
+    """Normalised common-neighbour count log(1+|N(u) & N(v)|)/scale, chunked to bound memory."""
+    if adj is None:
+        return None
+    chunk = max(1, max_elems // adj.size(1))
+    out = []
+    for s0 in range(0, src.size(0), chunk):
+        a, b = src[s0:s0 + chunk], dst[s0:s0 + chunk]
+        out.append(torch.log1p((adj[a] * adj[b]).sum(dim=1)) / scale)
+    return torch.cat(out).unsqueeze(-1)
+
+
 def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_name,
           loss_type="bce", focal_gamma=2.0, focal_alpha=0.25,
           asl_gamma_pos=0.0, asl_gamma_neg=4.0, asl_margin=0.05,
-          num_neg_samples=1, adj=None):
+          num_neg_samples=1, adj=None, cn_scale=6.2, hard_neg_sampler=None):
     model.train()
     predictor.train()
 
@@ -86,29 +99,15 @@ def train(model, predictor, g, x, split_edge, optimizer, batch_size, dataset_nam
 
         edge = pos_train_edge[perm].t()
 
-        cn_pos = None
-        if adj is not None:
-            cn_pos = (torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)) / 6.2).unsqueeze(-1) if edge[0].size(0) <= 200000 else None
-            if cn_pos is None:
-                # batch the CN lookup to avoid a huge intermediate tensor
-                cn_chunks = []
-                for start in range(0, edge[0].size(0), 50000):
-                    e0 = edge[0][start:start+50000]
-                    e1 = edge[1][start:start+50000]
-                    cn_chunks.append(torch.log1p((adj[e0] * adj[e1]).sum(dim=1)) / 6.2)
-                cn_pos = torch.cat(cn_chunks).unsqueeze(-1)
+        cn_pos = cn_feature(adj, edge[0], edge[1], cn_scale)
         pos_out = predictor(h[edge[0]], h[edge[1]], cn_pos)
 
-        edge = neg_sampler(g, edge[0])
+        if hard_neg_sampler is not None:
+            edge = hard_neg_sampler(g, edge[0], edge[1], num_neg_samples)
+        else:
+            edge = neg_sampler(g, edge[0])
 
-        cn_neg = None
-        if adj is not None:
-            cn_chunks = []
-            for start in range(0, edge[0].size(0), 50000):
-                e0 = edge[0][start:start+50000]
-                e1 = edge[1][start:start+50000]
-                cn_chunks.append(torch.log1p((adj[e0] * adj[e1]).sum(dim=1)) / 6.2)
-            cn_neg = torch.cat(cn_chunks).unsqueeze(-1)
+        cn_neg = cn_feature(adj, edge[0], edge[1], cn_scale)
         neg_out = predictor(h[edge[0]], h[edge[1]], cn_neg)
         if num_neg_samples > 1:
             pos_out_expanded = pos_out.repeat_interleave(num_neg_samples, dim=0)
@@ -156,7 +155,7 @@ def accuracy(pred, label):
 
 
 @torch.no_grad()
-def test(model, predictor, g, x, split_edge, evaluator, batch_size, adj=None):
+def test(model, predictor, g, x, split_edge, evaluator, batch_size, adj=None, cn_scale=6.2):
     model.eval()
     predictor.eval()
 
@@ -175,9 +174,7 @@ def test(model, predictor, g, x, split_edge, evaluator, batch_size, adj=None):
         preds = []
         for perm in DataLoader(range(test_edges.size(0)), batch_size):
             edge = test_edges[perm].t()
-            cn_feat = None
-            if adj is not None:
-                cn_feat = (torch.log1p((adj[edge[0]] * adj[edge[1]]).sum(dim=1)) / 6.2).unsqueeze(-1)
+            cn_feat = cn_feature(adj, edge[0], edge[1], cn_scale)
             pred = predictor(h[edge[0]], h[edge[1]], cn_feat).squeeze()
             if pred.dim() == 0:
                 pred = pred.unsqueeze(0)
@@ -345,6 +342,18 @@ def main():
                          help="ASL probability margin — shifts easy-negative loss contribution toward zero")
     parser.add_argument("--num_neg_samples", type=int, default=1,
                          help="number of negative edges sampled per positive edge during training (default 1, matches base paper)")
+    parser.add_argument("--legacy_loader", action="store_true",
+                         help="BIOSNAP/DrugBank: use the reference loader (separate train/test drug numbering). Default: fixed loader")
+    parser.add_argument("--hard_neg", type=str, default="none", choices=["none", "tanimoto"],
+                         help="tanimoto = chemically-informed hard negatives (Morgan fingerprints); BIOSNAP/DrugBank only")
+    parser.add_argument("--hard_neg_ratio", type=float, default=0.5,
+                         help="fraction of negatives drawn as Tanimoto hard negatives (rest uniform random)")
+    parser.add_argument("--hard_neg_top_m", type=int, default=50,
+                         help="hard negatives are drawn from each drug's top-M most similar drugs")
+    parser.add_argument("--save_artifacts", action="store_true",
+                         help="save best-epoch embeddings and model checkpoints (Phase 2/6 analysis)")
+    parser.add_argument("--tag", type=str, default="",
+                         help="label added to log/result filenames so different experiments never mix")
     parser.add_argument("--use_common_neighbors", action="store_true",
                          help="augment the link predictor with a common-neighbor-count structural feature")
     args = parser.parse_args()
@@ -375,10 +384,19 @@ def main():
             split_edge["eval_train"] = {"edge": split_edge["train"]["edge"][idx]}
             evaluator = Evaluator(name=dataset.name)
 
-        elif args.dataset == 'biosnapddi' or args.dataset == 'drugbankddi':
+        elif (args.dataset == 'biosnapddi' or args.dataset == 'drugbankddi') and args.legacy_loader:
             dataset = BioSnapDDIDataset(name=args.dataset)
             split_edge = dataset.get_edge_split()
             g = to_dgl_graph(dataset.get(0))
+            idx = torch.randperm(split_edge["train"]["edge"].size(0))
+            idx = idx[: split_edge["valid"]["edge"].size(0)]
+            split_edge["eval_train"] = {"edge": split_edge["train"]["edge"][idx]}
+            evaluator = TDCDDIEvaluator(name='TDC_DDI')
+
+        elif args.dataset == 'biosnapddi' or args.dataset == 'drugbankddi':
+            dataset = FixedDDIDataset(name=args.dataset, path='../dataset')
+            split_edge = dataset.get_edge_split()
+            g = dataset.graph
             idx = torch.randperm(split_edge["train"]["edge"].size(0))
             idx = idx[: split_edge["valid"]["edge"].size(0)]
             split_edge["eval_train"] = {"edge": split_edge["train"]["edge"][idx]}
@@ -392,7 +410,24 @@ def main():
             train_edges_cn = split_edge["train"]["edge"].to(device)
             adj[train_edges_cn[:, 0], train_edges_cn[:, 1]] = 1.0
             adj[train_edges_cn[:, 1], train_edges_cn[:, 0]] = 1.0
+        # normaliser log(avg degree): 6.2 for OGB-DDI (kept fixed for reproducibility), computed otherwise
+        if args.dataset == 'ogbl-ddi':
+            cn_scale = 6.2
+        else:
+            avg_deg = 2.0 * split_edge["train"]["edge"].size(0) / g.num_nodes()
+            cn_scale = max(math.log(max(avg_deg, math.e)), 1.0)
+        if args.use_common_neighbors:
+            print(f"Common-neighbour feature normaliser log(avg_degree) = {cn_scale:.3f}")
         # === END ===
+
+        hard_neg_sampler = None
+        if args.hard_neg == "tanimoto":
+            if not hasattr(dataset, "smiles"):
+                raise ValueError("--hard_neg tanimoto needs SMILES: use biosnapddi/drugbankddi with the fixed loader")
+            from hard_negatives import TanimotoHardNegativeSampler
+            hard_neg_sampler = TanimotoHardNegativeSampler(
+                dataset.smiles, split_edge["train"]["edge"], g.num_nodes(), device,
+                top_m=args.hard_neg_top_m, hard_ratio=args.hard_neg_ratio)
 
         if dataset.name == "ogbl-ddi":
             emb = torch.nn.Embedding(g.num_nodes(), args.hidden_channels).to(device)
@@ -404,7 +439,8 @@ def main():
         # Model loop
         for model_name in all_models:
             print(f'\n=== Running model: {model_name} on {args.dataset} ===')
-            test_file_result = f"../results/test/{args.dataset}_{model_name}_results_{current_datetime}.csv"
+            tag = f"_{args.tag}" if args.tag else ""
+            test_file_result = f"../results/test/{args.dataset}_{model_name}{tag}_results_{current_datetime}.csv"
 
             # Model selection
             augment_embedding = None
@@ -505,14 +541,15 @@ def main():
                                  args.dataset, loss_type=args.loss_type,
                                  focal_gamma=args.focal_gamma, focal_alpha=args.focal_alpha,
                                  asl_gamma_pos=args.asl_gamma_pos, asl_gamma_neg=args.asl_gamma_neg,
-                                 asl_margin=args.asl_margin, num_neg_samples=args.num_neg_samples, adj=adj)
+                                 asl_margin=args.asl_margin, num_neg_samples=args.num_neg_samples, adj=adj,
+                                 cn_scale=cn_scale, hard_neg_sampler=hard_neg_sampler)
 
                     if epoch % args.eval_steps == 0:
-                        results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size, adj=adj)
+                        results, h_eval = test(model, predictor, g, g.ndata["feat"], split_edge, evaluator, args.batch_size, adj=adj, cn_scale=cn_scale)
 
                         # === PHASE 2 DIAGNOSIS: save embeddings + pos/neg pair features at best-valid-Hits@20 epoch ===
                         valid_hits20 = results["Hits@20"][1]
-                        if valid_hits20 > best_valid_hits20:
+                        if args.save_artifacts and valid_hits20 > best_valid_hits20:
                             best_valid_hits20 = valid_hits20
                             emb_dir = f"../embeddings/{dataset.name}_{model_name}"
                             os.makedirs(emb_dir, exist_ok=True)
@@ -549,7 +586,7 @@ def main():
                             # === END PHASE 6 ===
                         # === END PHASE 2 DIAGNOSIS ===
 
-                        log_file_path = f"../results/training/run{run}_{dataset.name}_{model_name}_train_validation.csv"
+                        log_file_path = f"../results/training/run{run}_{dataset.name}_{model_name}{tag}_train_validation.csv"
                         os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
                         with open(log_file_path, "a") as log_file:
