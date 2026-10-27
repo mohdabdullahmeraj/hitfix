@@ -15,7 +15,10 @@ from torch.nn import Linear
 from torch.utils.data import DataLoader
 from biosnap_data_loader import BioSnapDDIDataset
 from fixed_ddi_loader import FixedDDIDataset
-from tdc_data_loader import TDCDDIDataset
+try:  # only needed for the TDC dataset path; optional so PyTDC/pyarrow versions can't break other runs
+    from tdc_data_loader import TDCDDIDataset
+except ImportError:
+    TDCDDIDataset = None
 
 
 from All_models import SAGE,SkipConnSAGE,GAT,GCN,SAGE_NGNN,GCNEncoder, SAGEEncoder, GATEncoder,GCNSkipConnection,SAGE_mlp
