@@ -347,6 +347,8 @@ def main():
                          help="number of negative edges sampled per positive edge during training (default 1, matches base paper)")
     parser.add_argument("--legacy_loader", action="store_true",
                          help="BIOSNAP/DrugBank: use the reference loader (separate train/test drug numbering). Default: fixed loader")
+    parser.add_argument("--eval_neg", type=str, default="provided", choices=["provided", "fair"],
+                         help="BIOSNAP/DrugBank validation/test negatives: as provided, or redrawn from drugs with training interactions")
     parser.add_argument("--hard_neg", type=str, default="none", choices=["none", "tanimoto"],
                          help="tanimoto = chemically-informed hard negatives (Morgan fingerprints); BIOSNAP/DrugBank only")
     parser.add_argument("--hard_neg_ratio", type=float, default=0.5,
@@ -397,7 +399,7 @@ def main():
             evaluator = TDCDDIEvaluator(name='TDC_DDI')
 
         elif args.dataset == 'biosnapddi' or args.dataset == 'drugbankddi':
-            dataset = FixedDDIDataset(name=args.dataset, path='../dataset')
+            dataset = FixedDDIDataset(name=args.dataset, path='../dataset', eval_neg=args.eval_neg)
             split_edge = dataset.get_edge_split()
             g = dataset.graph
             idx = torch.randperm(split_edge["train"]["edge"].size(0))

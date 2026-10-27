@@ -33,7 +33,8 @@ from sklearn.model_selection import train_test_split
 
 
 class FixedDDIDataset:
-    def __init__(self, name="biosnapddi", path="../dataset", valid_frac=0.2, seed=42, verbose=True):
+    def __init__(self, name="biosnapddi", path="../dataset", valid_frac=0.2, seed=42, verbose=True,
+                 eval_neg="provided"):
         self.name = name
         train_df = pd.read_csv(f"{path}/{name}/raw/train.csv")
         test_df = pd.read_csv(f"{path}/{name}/raw/test.csv")
@@ -80,6 +81,37 @@ class FixedDDIDataset:
             "valid": {"edge": torch.from_numpy(vp), "edge_neg": torch.from_numpy(vn)},
             "test": {"edge": test_pos, "edge_neg": test_neg},
         }
+
+        # 3b) optional fair evaluation negatives. The provided BIOSNAP negatives almost always contain a
+        # drug with no training interactions, so "unseen drug => no interaction" scores well without
+        # learning anything. "fair" redraws validation/test negatives from drugs that have training
+        # interactions, excluding every known positive; same number of negatives as provided.
+        self.stats["eval_neg"] = eval_neg
+        if eval_neg == "fair":
+            known = all_pos
+            tr_e = self.split_edge["train"]["edge"]
+            active = torch.unique(tr_e.flatten()).numpy()
+            rng = np.random.default_rng(seed)
+            used = set()
+            for split in ["valid", "test"]:
+                need = self.split_edge[split]["edge_neg"].size(0)
+                out = []
+                while len(out) < need:
+                    a = rng.choice(active, size=2 * need)
+                    b = rng.choice(active, size=2 * need)
+                    for x, y in zip(a, b):
+                        if x == y:
+                            continue
+                        p = (int(min(x, y)), int(max(x, y)))
+                        if p in known or p in used:
+                            continue
+                        used.add(p)
+                        out.append(p)
+                        if len(out) == need:
+                            break
+                self.split_edge[split]["edge_neg"] = torch.tensor(out, dtype=torch.long)
+        elif eval_neg != "provided":
+            raise ValueError("eval_neg must be 'provided' or 'fair'")
 
         # 4) message-passing graph: training-split positives only, undirected
         src = torch.cat([self.split_edge["train"]["edge"][:, 0], self.split_edge["train"]["edge"][:, 1]])
