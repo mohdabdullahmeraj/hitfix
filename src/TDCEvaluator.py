@@ -38,6 +38,16 @@ class TDCDDIEvaluator:
     def eval(self, input_dict):
 
         y_pred_pos, y_pred_neg, type_info = self._parse_and_check_input(input_dict)
+        # Fast path: main.py sets evaluator.K and only reads hits@K. The full metric set below
+        # (ROC-AUC, PR-AUC, and an O(n^2) Python-loop MRR) made each epoch take minutes on
+        # DrugBank-DDI. Hits@K is computed exactly as before, so results are unchanged.
+        K = getattr(self, "K", None)
+        if K is not None:
+            if type_info == 'torch':
+                y_pred_pos, y_pred_neg = y_pred_pos.cpu().numpy(), y_pred_neg.cpu().numpy()
+            if len(y_pred_pos) == 0 or len(y_pred_neg) == 0:
+                return {f'hits@{K}': 0.0}
+            return {f'hits@{K}': self._compute_hits(y_pred_pos, y_pred_neg, K)}
         return self._eval_metrics(y_pred_pos, y_pred_neg, type_info)
 
     @property
